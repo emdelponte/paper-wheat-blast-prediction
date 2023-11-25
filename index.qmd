@@ -1,0 +1,1163 @@
+---
+title: "Weather-based logistic regression models for predicting wheat head blast epidemics"
+author:
+   - name: Monalisa Cristina de Cól¹, Mauricio A. de Oliveira Coelho², Emerson M. Del Ponte¹
+
+     affiliation: "¹Universidade Federal de Vicosa, Vicosa MG, Brazil, ²Campo Experimental de Sertãozinho - Empresa de Pesquisa Agropecuária de Minas Gerais (EPAMIG), Patos de Minas, MG 38700-970, Brazil"
+editor: visual
+title-block-banner: "white"
+date-format: medium
+date: last-modified
+theme:
+  light: lux
+format: 
+  html: 
+     self-contained: true
+     smooth-scroll: true
+     toc: true
+     toc-location: left
+     toc-depth: 5
+     fig-width: 16
+     fig-height: 10
+     code-fold: false
+     css: styles.css
+---
+
+This QMD methodology encompasses data preparation and organization techniques, window creation around the wheat heading date, variable selection employing LASSO and best subset methodologies. It involves applying the logistic model, generating graphs, and conducting model testing using historical data.
+
+# PACKAGES
+
+```{r}
+#| warning: false
+
+library(AICcmodavg)
+library(bestglm)
+library(Boruta)
+library(car)
+library(caret)
+library(cowplot)
+library(dplyr)
+library(e1071)
+library(extrafont)
+library(ggplot2)
+library(ggthemes)
+library(gsheet)
+library(gbm)
+library(glmnet)
+library(gsheet)
+library(hrbrthemes)
+library(lubridate)
+library(magrittr)
+library(nasapower)
+library(OptimalCutpoints)
+library(pROC)
+library(PresenceAbsence)
+library(patchwork)
+library(pROC)
+library(reshape2)
+library(rpart)
+library(rpart.plot)
+library(randomForest)
+library(tidyverse)
+library(tidytext)
+library(VGAM)
+```
+
+# IMPORTING DATA
+
+## Trial data
+
+```{r}
+#| warning: false
+trials_data <- gsheet2tbl("https://docs.google.com/spreadsheets/d/1U5_Mz9jvRCbIYZmCJCHXwkbmUVDH6wB717GHiXaptbI/edit#gid=990563228")
+
+
+summary(trials_data$index_mean)
+summary(trials_data$inc_mean)
+trials_data = trials_data |> 
+  dplyr::select(-yld_mean)
+
+```
+
+###Organizing the trial data 
+
+```{r}
+#| warning: false
+#S1- Adjusting the format of the "heading" variable to a date object S2- Creating two new variables that represent dates 28 days before and 28 days after the original date
+trials_setup <- trials_data %>%
+  mutate(
+    heading = as.Date(heading, format = "%d-%m-%Y") #S1
+  ) %>%
+  mutate(
+    minus28 = heading - 28,
+    plus28 = heading + 28
+  ) #S2
+
+#S3 - Defining the outbreak and non-outbreak threshold.
+trials_setup2 = trials_setup |> filter(!is.na(inc_mean)) %>%
+  mutate(epidemic = case_when(
+    inc_mean <= 20 ~ 0,
+   inc_mean > 20  ~ 1)) |> 
+  na.omit() #S3
+
+
+trials_setup2 |> group_by(epidemic) |> 
+  count()
+
+```
+
+## Nasa Power
+
+Importing climate data from NASA POWER and saving it
+
+```{r eval=FALSE, include=FALSE}
+#IMPORTING DATA FROM NASAPOWER AND CREATING A NEW DATAFRAME WITH THE WEATHER DATA
+
+
+#box = data.frame()
+
+#for(i in 1:length(trials_setup$study)){
+
+#lil_nasa <- get_power(
+ # community = "ag",
+  #temporal_api = "daily",
+  #dates = c(trials_setup$minus28[i] , trials_setup$plus28[i]),
+  #lonlat = c(trials_setup$longitude[i], trials_setup$latitude[i]),
+   #pars = c("T2M", "RH2M","PRECTOTCORR", "T2M_MAX", "T2M_MIN","T2MDEW", "ALLSKY_SFC_PAR_TOT")
+ #) %>%
+  # mutate(study = trials_setup$study[i])
+  #box = box %>%
+#bind_rows(lil_nasa) 
+#}
+
+#write.csv(box, "weather_data2.csv")
+```
+
+## Weather data
+
+```{r}
+#| warning: false
+weather_data <- read.csv("G:/.shortcut-targets-by-id/1j8VI38P0Brg7eT5kzCji1n5U9EbAceqw/Monalisa/WB_prediction/mona/WB/weather_data2.csv")
+```
+
+## Combining Trials and weather data
+
+```{r}
+#| warning: false
+data_model2 <- full_join(trials_setup2, weather_data)
+```
+
+# WINDOW TIME
+
+Wheat heading date (WHD) was used to create four window time, each comprising two seven-day intervals (before and after WHD)
+
+```{r}
+#| warning: false
+data_WBTM2 <- data_model2 %>%
+  mutate(
+    YYYYMMDD = as.Date(YYYYMMDD),
+    days = as.numeric(-(heading - YYYYMMDD))
+  ) 
+
+data_WBTM2.1 = data_WBTM2 |> 
+  mutate(
+    single_week = case_when(
+      days < -21 ~ "NO",
+      days >= -21 & days < -14 ~ "NO",
+      days >= -14 & days < -7 ~ "wb2",
+      days >= -7 & days <= 0 ~ "wb1",
+      days > 0 & days <= 7 ~ "wa1",
+      days > 7 & days <= 14 ~ "wa2",
+      days > 14 & days <= 21 ~ "NO",
+      days > 21 ~ "NO"))
+```
+
+# WEATHER VARIABLES
+
+Here, new weather variables were created based on defined conditions. Additionally, some interactions were tested, and those with a correlation greater than 95% were excluded.
+
+```{r}
+#| warning: false
+data_m2 = data_WBTM2.1 %>%
+  # relative humidity
+  mutate(
+   RH90t = ifelse(RH2M >= 90, 1, 0)
+  ) %>%
+  # temperature
+  mutate(
+    ND.TMEAN.22_28 = ifelse(T2M >= 22 & T2M <= 28, 1, 0),
+    ND.TMEAN.S22 = ifelse(T2M < 22, 1, 0),
+    ND.TMEAN.G28 = ifelse(T2M > 28, 1, 0),
+   
+  ) %>%
+  # rainfall
+  mutate(
+    RAIN.ND.G0 = ifelse(PRECTOTCORR > 0, 1, 0),
+    
+  ) %>%
+  
+  
+  group_by(study, single_week, epidemic) %>%
+  summarise(
+    # RH
+    RH = mean(RH2M),
+    RH90 = sum(RH90t),
+    
+    
+    # Temperature
+    TMEANMAX = mean(T2M_MAX),
+    TMEANMIN = mean(T2M_MIN),
+    TMEAN = mean(T2M),
+
+    ND.TMEAN.S22 = sum(ND.TMEAN.S22),
+   
+    # Rain
+    RAINSUM = sum(PRECTOTCORR),
+    RAIN.ND.G0 = sum(RAIN.ND.G0),
+
+# Interactions
+#TminRH = TMEANMIN * RH ,
+#TminRainsum = TMEANMIN * RAINSUM,
+#TminRH90 = TMEANMIN * RH90,
+TmeanRH= TMEAN * RH)
+#TmeanRainsum= TMEAN * RAINSUM,
+#TmeanRH90= TMEAN * RH90)
+
+```
+
+## Correlation
+
+```{r}
+#| warning: false
+data_cor = data_m2 |> 
+ ungroup() |> 
+  dplyr::select(-study, -single_week, -epidemic)
+
+correlationMatrix <- cor(data_cor)
+# summarize the correlation matrix
+box = data.frame(print(correlationMatrix))
+# find attributes that are highly corrected (ideally >0.75)
+highlyCorrelated <- findCorrelation(correlationMatrix, cutoff=0.5)
+
+
+```
+
+# COMBINING WEATHER VARIABLES WITH WINDOW TIME
+
+```{r}
+#| warning: false
+one_week_datam2 =  data_m2 |>  
+  pivot_wider(
+    names_from = single_week,
+    values_from = c(
+      RH,
+      RH90,
+      TMEANMAX,
+    TMEANMIN,
+    TMEAN,
+     ND.TMEAN.S22,
+    RAINSUM,
+    RAIN.ND.G0,TmeanRH
+    ))
+```
+
+## Organizing the data
+
+```{r}
+#| warning: false
+one_week_data_m2 <- one_week_datam2 %>%
+  dplyr::select(-ends_with("NO"))
+
+data_var2 <-one_week_data_m2
+data_var2 <- data_var2 %>%
+  ungroup()
+
+data_varm2 = data_var2 |> 
+  dplyr::select(-study) 
+```
+
+# LASSO
+
+Selecting predictor variables
+
+```{r}
+#| warning: false
+#| fig-width: 8
+#| fig-height: 6
+set.seed(123)
+lambdas <- 10^seq(2, -3, by = -.1)
+
+y <- data_varm2 %>%
+  dplyr::select(epidemic) %>%
+  as.matrix()
+
+X <- data_varm2%>%
+  dplyr::select(-epidemic) %>%
+  as.matrix()
+
+
+# Setting alpha = 1 implements lasso regression
+lasso_reg_1week <- cv.glmnet(X, y,
+  alpha = 1,
+  family = "binomial",
+  lambda = lambdas,
+  standardize = TRUE,
+  nfolds = 5
+)
+plot(lasso_reg_1week)
+
+# Best lambda
+lambda_best_1week <- lasso_reg_1week$lambda.min
+lambda_best_1week
+
+lasso_model_1week <- glmnet(X,
+  y,
+  alpha = 1,
+  family = "binomial",
+  lambda = lambda_best_1week,
+  standardize = TRUE
+)
+
+#Selected variables with non-zero coefficients
+coef(lasso_model_1week)
+
+assess.glmnet(lasso_model_1week,
+  newx = X,
+  newy = y
+)
+
+plot(roc.glmnet(lasso_model_1week,
+  newx = X,
+  newy = factor(y)
+),
+type = "l"
+) # produces
+
+```
+
+# BEST SUBSET
+
+Applying the variables selected by LASSO to obtain the best combinations
+
+```{r}
+#| warning: false
+#BEST variable
+data_v <- data.frame(data_varm2)
+dat <- data_v %>%
+dplyr::select(epidemic,RH_wa1,
+RH_wb1,
+RH_wb2 ,
+ND.TMEAN.S22_wb2,
+RAINSUM_wa1,
+RAIN.ND.G0_wb1,
+TmeanRH_wa2,
+TmeanRH_wb1 ,
+TmeanRH_wb2 ) %>%
+  mutate(y = epidemic) %>%
+  dplyr::select(-1)
+dat <- data.frame(dat)
+
+best.logit2 <- bestglm(
+  Xy = dat,
+  family = binomial,
+  IC = "BIC",
+  TopModels = 50000,
+  method = "exhaustive",
+  nvmax = 10
+)
+summary(best.logit2$BestModel)
+best.logit2$Subsets
+
+
+f <- data.frame(best.logit2$Subsets)
+```
+
+## Distribution of the top six predictor variables
+
+Fig. 3. Box plots illustrating the distribution of the top six predictor variables of wheat head blast disease in 143 epidemics classified as outbreak (1) and non-outbreak (0).
+
+```{r}
+#| warning: false
+#| fig-width: 6
+#| fig-height: 10
+#RAINSUM_wa1
+pm1 = data_var2 |> 
+  ggplot(aes(as.factor(epidemic), RAINSUM_wa1))+
+   geom_boxplot( width = 0.3, alpha = 0.5, fill= 'white')+
+  theme_half_open()+
+  labs(x = "", y = "Rainsum_wa1")+
+  scale_y_continuous(breaks = seq(0, 100, 10), limits = c(0, 100))
+
+#ND.TMEAN.S22_wb2
+pm2 = data_var2 |> 
+  ggplot(aes(as.factor(epidemic), ND.TMEAN.S22_wb2))+
+  geom_boxplot( width = 0.3, alpha = 0.5, fill= 'white')+
+  theme_half_open()+
+  labs(x = "", y = "ND.Tmean.S22_wb2")+
+  scale_y_continuous(breaks = seq(0, 10, 1), limits = c(0, 10))
+
+#RHM_wa1
+pm3 = data_var2 |> 
+  ggplot(aes(as.factor(epidemic), RH_wa1))+
+  geom_boxplot( width = 0.3, alpha = 0.5, fill= 'white')+
+  theme_half_open()+
+  labs(x = "", y = "RH_wa1")+
+  scale_y_continuous(breaks = seq(40, 100, 10), limits = c(40, 100))
+
+
+#RHM_wb2
+pm4 = data_var2 |> 
+  ggplot(aes(as.factor(epidemic), RH_wb2))+
+   geom_boxplot( width = 0.3, alpha = 0.5, fill= 'white')+
+  theme_half_open()+
+  labs(x = "", y = "RH_wb2")+
+  scale_y_continuous(breaks = seq(40, 100, 10), limits = c(40, 100))
+
+
+#INT4_wb2 
+pm5 = data_var2 |> 
+  ggplot(aes(as.factor(epidemic), TmeanRH_wb2))+
+  geom_boxplot( width = 0.3, alpha = 0.5, fill= 'white')+
+  theme_half_open()+
+  labs(x = "Epidemic", y = "TmeanRH_wb2")+
+  scale_y_continuous(breaks = seq(500,2500, 500), limits = c(500, 2500))
+
+#INT4_wb1
+pm6 = data_var2 |> 
+  ggplot(aes(as.factor(epidemic), TmeanRH_wb1))+
+  geom_boxplot( width = 0.3, alpha = 0.5, fill= 'white')+
+  theme_half_open()+
+  labs(x = "Epidemic", y = "TmeanRH_wb1")+
+  scale_y_continuous(breaks = seq(500, 2500, 500), limits = c(500, 2500))
+
+#joining the plots
+(pm1 | pm2)/
+( pm3 | pm4)/
+  (pm5 | pm6)
+
+#Saving 
+#ggsave("boxplot_m12.png", width = 6 ,  height = 8, bg = "white", dpi = 1000)
+
+```
+
+
+# LOGISTIC MODEL M2
+
+```{r}
+#| warning: false
+#| fig-width: 8
+#| fig-height: 6
+model_lasso2.2 <- glm(epidemic ~ RH_wa1 + TmeanRH_wb2, family = "binomial",data = data_varm2)
+summary(model_lasso2.2)
+
+#checking for multicollinearity by using the variance inflation factor 
+vif(model_lasso2.2)
+
+pred_lasso <- predict(model_lasso2.2, data_varm2, type = "response")
+
+#Better thresholds
+dat_lasso <- data.frame(1, data_varm2$epidemic, pred_lasso)
+optimal.thresholds(dat_lasso)
+
+# Confusion matrix with the MAXsen+spe threshold
+confusionMatrix(data = as.factor(as.numeric(pred_lasso > 0.44)),  mode= "everything",  reference = as.factor(data_varm2$epidemic))
+
+#Plot
+auc.roc.plot(dat_lasso)
+
+error.threshold.plot(dat_lasso, opt.methods = 3) #takes a single model and plots the sensitivity and specificity as a function of threshold. 
+
+presence.absence.accuracy(dat_lasso,threshold=.44,st.dev=FALSE) #Calculates five accuracy measures (pcc, sensitivity, specificity, Kappa, and AUC)
+
+presence.absence.summary(dat_lasso) #Produces four types of Presence/Absence accuracy plots for a single set of model Predictions
+
+roc_data2.2 <- roc.plot.calculate(dat_lasso) #data frame
+
+```
+
+## LOOCV
+
+```{r}
+#| warning: false
+acc <- NULL
+for(i in 1:nrow(data_varm2))
+{
+    # Train-test splitting
+    # 499 samples -> fitting
+    # 1 sample -> testing
+    train <- data_var2[-i,]
+    test <- data_var2[i,]
+    
+    # Fitting
+    model <- glm(epidemic ~ RH_wa1 + TmeanRH_wb2, family=binomial,data=train)
+    
+    # Predict results
+    results_prob <- predict(model,test,type='response')
+    
+    # If prob > 0.5 then 1, else 0
+    results <- ifelse(results_prob > 0.44,1,0)
+    
+    # Actual answers
+    answers <- test$epidemic
+    
+    # Calculate accuracy
+    misClasificError <- mean(answers != results)
+    
+    # Collecting results
+    acc[i] <- 1-misClasificError
+}
+
+# Average accuracy of the model
+mean(acc)
+```
+
+# LOGISTIC MODEL M3
+
+```{r}
+#| warning: false
+#| fig-width: 8
+#| fig-height: 6
+model_lasso2.3 <- glm(epidemic ~ RH_wb2 + ND.TMEAN.S22_wb2 + RAINSUM_wa1, family = "binomial",data = data_varm2)
+
+summary(model_lasso2.3)
+
+pred_lasso <- predict(model_lasso2.3, data_varm2, type = "response")
+
+vif(model_lasso2.3)
+
+#Better thresholds
+dat_lasso <- data.frame(1, data_varm2$epidemic, pred_lasso)
+
+optimal.thresholds(dat_lasso)
+
+# Confusion matrix with the MAXsen+spe threshold
+confusionMatrix(data = as.factor(as.numeric(pred_lasso > 0.68)),  mode= "everything",  reference = as.factor(data_varm2$epidemic))
+
+
+#Plot
+ auc.roc.plot(dat_lasso)
+
+#takes a single model and plots the sensitivity and specificity as a function of threshold. 
+error.threshold.plot(dat_lasso, opt.methods = 3) 
+
+#Calculates five accuracy measures (pcc, sensitivity, specificity, Kappa, and AUC)
+presence.absence.accuracy(dat_lasso,threshold=.68,st.dev=FALSE) 
+
+#Produces four types of Presence/Absence accuracy plots for a single set of model Predictions
+presence.absence.summary(dat_lasso) 
+
+roc_data2.3 <- roc.plot.calculate(dat_lasso) #data frame
+
+```
+
+## LOOCV
+
+```{r}
+#| warning: false
+acc <- NULL
+for(i in 1:nrow(data_varm2))
+{
+    # Train-test splitting
+    # 499 samples -> fitting
+    # 1 sample -> testing
+    train <- data_var2[-i,]
+    test <- data_var2[i,]
+    
+    # Fitting
+    model <- glm(epidemic ~  RH_wb2 + ND.TMEAN.S22_wb2 + RAINSUM_wa1, family=binomial,data=train)
+    
+    # Predict results
+    results_prob <- predict(model,test,type='response')
+    
+    # If prob > 0.5 then 1, else 0
+    results <- ifelse(results_prob > 0.68,1,0)
+    
+    # Actual answers
+    answers <- test$epidemic
+    
+    # Calculate accuracy
+    misClasificError <- mean(answers != results)
+    
+    # Collecting results
+    acc[i] <- 1-misClasificError
+}
+
+# Average accuracy of the model
+mean(acc)
+```
+
+# LOGISTIC MODEL M4
+
+```{r}
+#| warning: false
+#| fig-width: 8
+#| fig-height: 6
+model_lasso2.4 <- glm(epidemic ~ RH_wb2 +ND.TMEAN.S22_wb2 + RAINSUM_wa1 +  TmeanRH_wb1, family = "binomial",data = data_varm2)
+
+summary(model_lasso2.4)
+
+pred_lasso4 <- predict(model_lasso2.4, data_varm2, type = "response")
+
+vif(model_lasso2.4)
+
+#Better thresholds
+dat_lasso4 <- data.frame(1, data_varm2$epidemic, pred_lasso4)
+
+optimal.thresholds(dat_lasso4)
+
+ # Confusion matrix with the MAXsen+spe threshold
+confusionMatrix(data = as.factor(as.numeric(pred_lasso4 > 0.62)),  mode= "everything",  reference = as.factor(data_varm2$epidemic))
+
+#Plot
+auc.roc.plot(dat_lasso4)
+
+#takes a single model and plots the sensitivity and specificity as a function of threshold. 
+error.threshold.plot(dat_lasso4, opt.methods = 3) 
+
+#Calculates five accuracy measures (pcc, sensitivity, specificity, Kappa, and AUC)
+presence.absence.accuracy(dat_lasso4,threshold=.62,st.dev=FALSE) 
+
+#Produces four types of Presence/Absence accuracy plots for a single set of model Predictions
+presence.absence.summary(dat_lasso4) 
+
+roc_data2.4 <- roc.plot.calculate(dat_lasso4) #data frame
+```
+
+##LOOCV
+
+```{r}
+#| warning: false
+acc <- NULL
+for(i in 1:nrow(data_varm2))
+{
+    # Train-test splitting
+    # 499 samples -> fitting
+    # 1 sample -> testing
+    train <- data_var2[-i,]
+    test <- data_var2[i,]
+    
+    # Fitting
+    model <- glm(epidemic ~ RH_wb2 +ND.TMEAN.S22_wb2 + RAINSUM_wa1 +  TmeanRH_wb1, family=binomial,data=train)
+    
+    # Predict results
+    results_prob <- predict(model,test,type='response')
+    
+    # If prob > 0.5 then 1, else 0
+    results <- ifelse(results_prob > 0.62,1,0)
+    
+    # Actual answers
+    answers <- test$epidemic
+    
+    # Calculate accuracy
+    misClasificError <- mean(answers != results)
+    
+    # Collecting results
+    acc[i] <- 1-misClasificError
+}
+
+# Average accuracy of the model
+mean(acc)
+```
+
+# LOGISTIC MODEL M5
+
+```{r}
+#| warning: false
+#| fig-width: 8
+#| fig-height: 6
+model_lasso2.5 <- glm(epidemic ~ RH_wa1 + RH_wb2 + ND.TMEAN.S22_wb2+ RAINSUM_wa1 + TmeanRH_wb1, family = binomial(link = 'logit'),data = data_varm2)
+
+summary(model_lasso2.5)
+
+vif(model_lasso2.5)
+
+pred_lasso5 <- predict(model_lasso2.5, data_varm2, type = "response")
+
+
+#Better thresholds
+dat_lasso5 <- data.frame(1, data_varm2$epidemic, pred_lasso5)
+
+optimal.thresholds(dat_lasso5)
+
+# Confusion matrix with the MAXsen+spe threshold
+confusionMatrix(data = as.factor(as.numeric(pred_lasso5 > 0.64)),  mode= "everything",  reference = as.factor(data_varm2$epidemic))
+
+#Plot
+auc.roc.plot(dat_lasso5)
+
+#takes a single model and plots the sensitivity and specificity as a function of threshold. 
+error.threshold.plot(dat_lasso5, opt.methods = 3) 
+
+ #Calculates five accuracy measures (pcc, sensitivity, specificity, Kappa, and AUC)
+presence.absence.accuracy(dat_lasso,threshold=.64,st.dev=FALSE)
+
+#Produces four types of Presence/Absence accuracy plots for a single set of model Predictions
+presence.absence.summary(dat_lasso) 
+
+roc_data2.4 <- roc.plot.calculate(dat_lasso) #data frame
+
+```
+
+##LOOCV
+
+```{r}
+#| warning: false
+acc <- NULL
+for(i in 1:nrow(data_varm2))
+{
+    # Train-test splitting
+    # 499 samples -> fitting
+    # 1 sample -> testing
+    train <- data_var2[-i,]
+    test <- data_var2[i,]
+    
+    # Fitting
+    model <- glm(epidemic ~  RH_wa1 + RH_wb2 + ND.TMEAN.S22_wb2+ RAINSUM_wa1 + TmeanRH_wb1, family=binomial,data=train)
+    
+    # Predict results
+    results_prob <- predict(model,test,type='response')
+    
+    # If prob > 0.5 then 1, else 0
+    results <- ifelse(results_prob > 0.64,1,0)
+    
+    # Actual answers
+    answers <- test$epidemic
+    
+    # Calculate accuracy
+    misClasificError <- mean(answers != results)
+    
+    # Collecting results
+    acc[i] <- 1-misClasificError
+}
+
+# Average accuracy of the model
+mean(acc)
+
+```
+
+# FIGURE LASSO
+
+Fig. 2. Selected (dark gray) weather variables, with their respective coefficient value, by the LASSO regression in each time window.
+
+```{r}
+#| warning: false
+#| fig-width: 8
+#| fig-height: 6
+#loading data
+lasso = gsheet2tbl("https://docs.google.com/spreadsheets/d/1Xb-EYCW1EHYd5HAg12SSI18Ue4sb8411v7z9H7DSH0Q/edit#gid=452944216")
+
+# Defines the colors for the squares
+cores <- c("not selected" = "#dcdcdc", "selected" = '#515151')
+
+ lasso %>%
+  mutate(lasso = ifelse(lasso == 1, "selected", "not selected")) %>%
+  mutate(window_panes = factor(window_panes, levels = c("b2", "b1", "a1", "a2"))) %>%
+  ggplot(aes(x = window_panes, y = weather_variables, fill = lasso)) +
+  geom_tile( width = 0.98, height = 0.98) +
+  scale_y_discrete() +
+  scale_fill_manual(values = cores) +
+  labs(x = "Window Panes", y = "Weather Variables", fill = "LASSO") +
+  theme_classic() +
+  theme(legend.position = "none")+  
+   theme(text = element_text(size = 14))+
+  labs(x = "Time window", y= "Weather variables")+
+ geom_text(aes(label = ifelse(coef == 0, format(round(coef), nsmall = 0), format(round(coef, 4)))),
+            size = 4, color = '#dcdcdc') # Formatação dos rótulos
+
+ 
+#ggsave('gr_lasso.png', width =5, height = 6, dpi = 500, bg = "white") 
+
+```
+
+#FIGURE BEST SUBSET
+
+Supplementary Fig. 1. Relationship between the number of variables and model evaluation metrics: A comprehensive analysis of log-likelihood (A) and Bayesian Information Criterion (B).
+
+```{r}
+#| warning: false
+#| fig-width: 8
+#| fig-height: 6
+best = gsheet2tbl("https://docs.google.com/spreadsheets/d/1Xb-EYCW1EHYd5HAg12SSI18Ue4sb8411v7z9H7DSH0Q/edit#gid=746618268")
+
+
+# Set the font to Arial
+loadfonts(device = "win")
+font <- "Arial"
+
+log = best %>%
+  ggplot(aes(n_variaveis, loglike)) +
+  geom_line( color = "black", linetype = "solid", size = 0.8) +
+  geom_point(color = "black", size = 2, shape = 16) +
+  scale_x_continuous(breaks = seq(0, 9, 1), limits = c(0, 9))+
+   scale_y_continuous(breaks = seq(-100, -45, 10), limits = c(-100, -45))+
+  labs(x = "Number of variables", y = "Loglikelihood") +
+  theme_classic() + theme(text = element_text(family = font, size = 14))
+
+bic = best %>%
+  ggplot(aes(n_variaveis, bic)) +
+  geom_line(color = "black", linetype = "solid", size = 0.8) +
+  geom_point(color = "black", size = 2, shape = 16) +
+  scale_x_continuous(breaks = seq(0, 9, 1), limits = c(0, 9))+
+   scale_y_continuous(breaks = seq(120, 200, 10), limits = c(120,200))+
+  labs(x = "Number of variables", y = "Bayesian information criterion") +
+  theme_classic()+ theme(text = element_text(family = font, size = 14))
+
+
+
+(log|bic) + plot_annotation(tag_levels = 'A')
+#ggsave('bestglm.png', width =10, height = 6, bg = "white", dpi = 1000)
+```
+
+# MODEL COMPARISON AND EXPERT EVALUATION
+
+## Import data from Nasapower
+
+```{r}
+#| warning: false
+library(nasapower)
+library(tidyverse)
+library(patchwork)
+
+
+
+uberaba <- get_power(community = "ag",
+                      lonlat = c(-47.9340, -19.7460),
+                      pars = c("RH2M", "T2M", "T2M_MAX", 
+                               "T2M_MIN", "PRECTOTCORR"),
+                      dates = c("2000-01-01", "2023-09-15"),
+                      temporal_api = "daily")
+
+
+ passofundo<-  get_power(community = "ag",
+                      lonlat = c(-52.4083, -28.2612),
+                      pars = c("RH2M", "T2M", "T2M_MAX", 
+                               "T2M_MIN", "PRECTOTCORR"),
+                      dates = c("2000-08-01", "2023-10-15"),
+                      temporal_api = "daily")
+
+ londrina <-  get_power(community = "ag",
+                      lonlat = c(-51.1732, -23.2927),
+                      pars = c("RH2M", "T2M", "T2M_MAX", 
+                               "T2M_MIN", "PRECTOTCORR"),
+                      dates = c("2000-06-01", "2023-10-10"),
+                      temporal_api = "daily")
+
+
+
+```
+
+## Function
+
+```{r}
+#| warning: false
+wheat_blast <- function(data, date_str){
+
+  heading <- as.Date(date_str, origin = "1970-01-01")
+  data2 <- data %>%
+    mutate(
+      heading = as.Date(heading),
+      days = as.numeric(-(heading - YYYYMMDD))
+    ) |> 
+    mutate(
+      single_week = case_when(
+        days < -21 ~ "NO",
+        days >= -21 & days < -14 ~ "NO",
+        days >= -14 & days < -7 ~ "wb2",
+        days >= -7 & days <= 0 ~ "wb1",
+        days > 0 & days <= 7 ~ "wa1",
+        days > 7 & days <= 14 ~ "wa2",
+        days > 14 & days <= 21 ~ "NO",
+        days > 21 ~ "NO")
+    ) |> 
+    filter(single_week != "NO") |> 
+    mutate(
+      RH90t = ifelse(RH2M >= 90, 1, 0),
+      ND.TMEAN.22_28 = ifelse(T2M >= 22 & T2M <= 28, 1, 0),
+      ND.TMEAN.S22 = ifelse(T2M < 22, 1, 0),
+      ND.TMEAN.G28 = ifelse(T2M > 28, 1, 0),
+      RAIN.ND.G0 = ifelse(PRECTOTCORR > 0, 1, 0)
+    ) |> 
+    group_by(single_week) |> 
+    summarise(
+      RHM = mean(RH2M),
+      RH90N = sum(RH90t),
+      TMEANMAX = mean(T2M_MAX),
+      TMEANMIN = mean(T2M_MIN),
+      TMEAN = mean(T2M),
+      ND.TMEAN.S22 = sum(ND.TMEAN.S22),
+      RAINSUM = sum(PRECTOTCORR),
+      RAIN.ND.G0 = sum(RAIN.ND.G0),
+      INT4 = TMEAN*RHM
+    ) |>  
+    pivot_wider(
+      names_from = single_week,
+      values_from = c(
+        RHM,
+        RH90N,
+        TMEANMAX,
+        TMEANMIN,
+        TMEAN,
+        ND.TMEAN.S22,
+        RAINSUM,
+        RAIN.ND.G0, 
+        INT4
+      ),
+      values_fill = 0
+    )
+# Calculo das probabilidades para cada modelo
+  
+   model1 <- -15.907922 + 0.136713 * data2$RHM_wa1 + 0.004216 * data2$INT4_wb2
+  prob1 <- exp(model1) / (1 + exp(model1))
+  
+  model2 <- -10.84637 + 0.16417 * data2$RHM_wb2 - 0.32558 * data2$ND.TMEAN.S22_wb2 + 0.06925 * data2$RAINSUM_wa1
+  prob2 <- exp(model2) / (1 + exp(model2))
+  
+  model3 <- -12.984671 + 0.141427 * data2$RHM_wb2 - 0.226089 * data2$ND.TMEAN.S22_wb2 + 0.068616 * data2$RAINSUM_wa1 + 0.002281 * data2$INT4_wb1
+  prob3 <- exp(model3) / (1 + exp(model3))
+
+  model4 <- -13.633025 + 0.052137 * data2$RHM_wa1 + 0.113687 * data2$RHM_wb2 - 0.264446 * data2$ND.TMEAN.S22_wb2 + 0.052856 * data2$RAINSUM_wa1 + 0.001763 * data2$INT4_wb1
+  prob4 <- exp(model4) / (1 + exp(model4))
+
+  # Retornar as probabilidades como parte do resultado da função
+  data.frame(data = as.Date(date_str), prob1 = prob1, prob2 = prob2, prob3 = prob3, prob4 = prob4)
+}
+
+
+```
+
+## Uberaba
+
+```{r}
+#| warning: false
+#| fig-width: 8
+#| fig-height: 6
+years <- 2000:2023
+wheat_blast_list <- list()
+for (year in years) {
+  dates <- seq(as.Date(paste0(year, "-04-15")), as.Date(paste0(year, "-05-15")), by = "day")
+  wheat_blast_list[[as.character(year)]] <- map_df(dates, ~ wheat_blast(uberaba, .))
+}
+
+uberaba3 <- reshape2::melt(wheat_blast_list, id.vars = "data")
+#write_xlsx(uberaba_2000_2023, "caminho/do/arquivo.xlsx")
+
+
+m_ub = uberaba3|> 
+ mutate(risk = case_when(
+    variable == "prob1" & value > 0.43 ~ "high",
+    variable == "prob2" & value > 0.44 ~ "high",
+    variable == "prob3" & value > 0.68 ~ "high",
+    variable == "prob4" & value > 0.62 ~ "high",
+    TRUE ~ "low"
+  ))
+
+m1_ub = m_ub |> filter(variable == 'prob1') |> 
+  janitor::tabyl(L1,  risk) |> 
+   mutate(model = "1", freq = high / (low + high))
+
+m2_ub = m_ub |> filter(variable == 'prob2') |> 
+  janitor::tabyl(L1,  risk) |> 
+   mutate(model = "2", freq = high / (low + high))
+
+
+m3_ub = m_ub |> filter(variable == 'prob3') |> 
+  janitor::tabyl(L1,  risk) |> 
+   mutate(model = "3", freq = high / (low + high))
+
+m4_ub = m_ub |> filter(variable == 'prob4') |> 
+  janitor::tabyl(L1,  risk) |> 
+   mutate(model = "4",freq = high / (low + high))
+
+
+combined_df <- bind_rows(m2_ub, m1_ub, m3_ub, m4_ub)
+
+p1 = combined_df %>%
+  ggplot(aes(model, freq)) +
+  geom_boxplot(fill = "white", color = "black", alpha = 0.6, width = 0.5) +
+  labs(x = "", y = "", title = 'Uberaba, MG') +
+  theme_classic() +
+   scale_y_continuous(breaks = seq(0, 1, 0.1), limits = c(0, 1))
+   
+#######################################plot 2#########################################
+mean(uberaba3$value)
+median(uberaba3$value)
+g2_u =uberaba3 |> 
+  filter(variable == 'prob3') |> 
+    mutate(risk = case_when(value > 0.68 ~ "high",
+                          TRUE ~ "low")) |> 
+    janitor::tabyl(L1, risk) |> 
+  mutate(freq = high / (low + high)) |> 
+  ggplot(aes(L1, freq))+
+  geom_col(fill = "#B22222")+
+  labs(y = "Seasonal wheat blast risk index", 
+       x = "", title = 'Uberaba, MG') +
+  theme_classic()+
+   scale_y_continuous(breaks = seq(0, 1, 0.1), limits = c(0, 1))+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  geom_hline(yintercept = 0.71, linetype = "dashed") 
+
+
+```
+
+## Passo fundo
+
+```{r}
+#| warning: false
+#| fig-width: 8
+#| fig-height: 6
+years <- 2000:2023
+wheat_blast_list <- list()
+for (year in years) {
+  dates <- seq(as.Date(paste0(year, "-09-01")), as.Date(paste0(year, "-09-30")), by = "day")
+  wheat_blast_list[[as.character(year)]] <- map_df(dates, ~ wheat_blast(passofundo, .))
+}
+
+passofundo3 <- reshape2::melt(wheat_blast_list, id.vars = "data")
+#write_xlsx(uberaba_2000_2023, "caminho/do/arquivo.xlsx")
+
+
+m_passofundo = passofundo3|> 
+mutate(risk = case_when(
+    variable == "prob1" & value > 0.43 ~ "high",
+    variable == "prob2" & value > 0.44 ~ "high",
+    variable == "prob3" & value > 0.68 ~ "high",
+    variable == "prob4" & value > 0.62 ~ "high",
+    TRUE ~ "low"
+  ))
+
+m1_passofundo = m_passofundo |> filter(variable == 'prob1') |> 
+  janitor::tabyl(L1,  risk) |> 
+   mutate(model = "1", freq = high / (low + high))
+
+m2_passofundo = m_passofundo |> filter(variable == 'prob2') |> 
+  janitor::tabyl(L1,  risk) |> 
+   mutate(model = "2", freq = high / (low + high))
+
+
+m3_passofundo = m_passofundo |> filter(variable == 'prob3') |> 
+  janitor::tabyl(L1,  risk) |> 
+   mutate(model = "3", freq = high / (low + high))
+
+m4_passofundo = m_passofundo |> filter(variable == 'prob4') |> 
+  janitor::tabyl(L1,  risk) |> 
+   mutate(model = "4",freq = high / (low + high))
+
+
+combined6_df <- bind_rows(m2_passofundo, m1_passofundo, m3_passofundo, m4_passofundo)
+
+p5 = combined6_df %>%
+  ggplot(aes(model, freq)) +
+  geom_boxplot(fill = "white", color = "black", alpha = 0.6, width = 0.5) +
+  labs(x = "Models", y = "", title = 'Passo Fundo, RS') +
+  theme_classic() +
+   scale_y_continuous(breaks = seq(0, 1, 0.1), limits = c(0, 1))
+   
+####################################### Plot 2 #########################################
+mean(passofundo3$value)
+median(passofundo3$value)
+g2_ps =passofundo3 |> 
+  filter(variable == 'prob3') |> 
+    mutate(risk = case_when(value > 0.68 ~ "high",
+                          TRUE ~ "low")) |> 
+    janitor::tabyl(L1, risk) |> 
+  mutate(freq = high / (low + high)) |> 
+  ggplot(aes(L1, freq))+
+  geom_col(fill = "#B22222")+
+  labs(y = "", 
+       x = "", title = 'Passo Fundo, RS') +
+  theme_classic()+
+   scale_y_continuous(breaks = seq(0, 1, 0.1), limits = c(0, 1))+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  geom_hline(yintercept = 0.79, linetype = "dashed")  
+
+
+```
+
+## Londrina
+
+```{r}
+#| warning: false
+#| fig-width: 8
+#| fig-height: 6
+years <- 2000:2023
+wheat_blast_list <- list()
+for (year in years) {
+  dates <- seq(as.Date(paste0(year, "-06-15")), as.Date(paste0(year, "-07-15")), by = "day")
+  wheat_blast_list[[as.character(year)]] <- map_df(dates, ~ wheat_blast(londrina, .))
+}
+
+londrina3 <- reshape2::melt(wheat_blast_list, id.vars = "data")
+#write_xlsx(uberaba_2000_2023, "caminho/do/arquivo.xlsx")
+
+
+m_ln = londrina3|> 
+mutate(risk = case_when(
+    variable == "prob1" & value > 0.43 ~ "high",
+    variable == "prob2" & value > 0.44 ~ "high",
+    variable == "prob3" & value > 0.68 ~ "high",
+    variable == "prob4" & value > 0.62 ~ "high",
+    TRUE ~ "low"
+  ))
+
+m1_ln = m_ln |> filter(variable == 'prob1') |> 
+  janitor::tabyl(L1,  risk) |> 
+   mutate(model = "1", freq = high / (low + high))
+
+m2_ln = m_ln |> filter(variable == 'prob2') |> 
+  janitor::tabyl(L1,  risk) |> 
+   mutate(model = "2", freq = high / (low + high))
+
+
+m3_ln = m_ln |> filter(variable == 'prob3') |> 
+  janitor::tabyl(L1,  risk) |> 
+   mutate(model = "3", freq = high / (low + high))
+
+m4_ln = m_ln |> filter(variable == 'prob4') |> 
+  janitor::tabyl(L1,  risk) |> 
+   mutate(model = "4",freq = high / (low + high))
+
+combined5_df <- bind_rows(m2_ln, m1_ln, m3_ln, m4_ln)
+
+p6 = combined5_df %>%
+  ggplot(aes(model, freq)) +
+  geom_boxplot(fill = "white", color = "black", alpha = 0.6, width = 0.5) +
+  labs(x = "Models", y = "Frequency", title = 'Londrina, PR') +
+  theme_classic() +
+   scale_y_continuous(breaks = seq(0, 1, 0.1), limits = c(0, 1))
+   
+####################################### Plot 2 #########################################
+mean(londrina3$value)
+median(londrina3$value)
+g2_ln =londrina3 |> 
+  filter(variable == 'prob3') |> 
+    mutate(risk = case_when(value > 0.68 ~ "high",
+                          TRUE ~ "low")) |> 
+    janitor::tabyl(L1, risk) |> 
+  mutate(freq = high / (low + high)) |> 
+  ggplot(aes(L1, freq))+
+  geom_col(fill = "#B22222")+
+  labs(y = "", 
+       x = "", title = 'Londrina, PR') +
+  theme_classic()+
+   scale_y_continuous(breaks = seq(0, 1, 0.1), limits = c(0, 1))+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  geom_hline(yintercept = 0.65, linetype = "dashed") 
+
+
+
+```
+
+## Plot 
+
+```{r}
+#| warning: false
+#| fig-width: 15
+#| fig-height: 6
+#Fig. 4. Box-plots for the frequency of predicted outbreaks (incidence > 20%) across 24 years in mid-April to mid-May in Uberaba-MG (A), mid-June to mid-July in Londrina-PR (B), and September in Passo Fundo-RS (C) using four selected models (M2 to M5).
+p1|p5|p6
+
+#Fig. 5. Seasonal wheat head blast risk index (proportion of predicted outbreaks in a 30-day period) in different sites of Brazil from 2000 to 2022. (A) Uberaba-MG, (B) Londrina-PR and (C) Passo Fundo-RS. The dashed line indicates the general mean of the risk index in all years within each site.
+g2_u|g2_ps|g2_ln
+
+#ggsave("teste.png",  width = 12, height = 4, dpi = 1000, bg = "white")
+```
